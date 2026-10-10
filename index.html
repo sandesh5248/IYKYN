@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Fractal GPU Stress Test</title>
+<style>
+  :root { color-scheme: dark; --glass: rgba(15,18,34,.72); --line: rgba(255,255,255,.14); }
+  * { box-sizing: border-box; }
+  html, body { margin:0; width:100%; height:100%; overflow:hidden; background:#03040b; color:#eef2ff;
+    font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; }
+  canvas { position:fixed; inset:0; display:block; width:100%; height:100%; touch-action:none; }
+  .stats { position:fixed; top:16px; right:16px; background:var(--glass); border:1px solid var(--line); backdrop-filter:blur(16px);
+    border-radius:14px; padding:12px 16px; font-size:12px; line-height:1.7; font-variant-numeric:tabular-nums; min-width:220px; }
+  .stats b { color:#9eeaff; }
+  .panel { position:fixed; left:16px; bottom:16px; width:min(340px,calc(100vw - 32px)); padding:16px; border:1px solid var(--line);
+    background:var(--glass); backdrop-filter:blur(20px); border-radius:18px; }
+  .panel h1 { margin:0 0 12px; font-size:14px; letter-spacing:.04em; }
+  .control { margin:12px 0; }
+  .label { display:flex; justify-content:space-between; font-size:12px; margin-bottom:6px; color:#dfe6ff; }
+  output { color:#9eeaff; }
+  input[type=range] { width:100%; accent-color:#9c7bff; }
+  .buttons { display:flex; flex-wrap:wrap; gap:8px; margin-top:12px; }
+  button { color:#f5f6ff; border:1px solid var(--line); border-radius:10px; background:rgba(255,255,255,.07);
+    padding:8px 12px; cursor:pointer; font-weight:600; font-size:11px; }
+  button:hover { background:rgba(140,125,255,.25); }
+  .tip { margin-top:12px; font-size:11px; color:#a8b4d9; line-height:1.5; }
+  #error { display:none; position:fixed; inset:20% 10%; margin:auto; height:max-content; max-width:600px; padding:20px;
+    background:#220f22; border:1px solid #ff7ba9; border-radius:14px; white-space:pre-wrap; }
+</style>
+</head>
+<body>
+<canvas id="gl"></canvas>
+
+<div class="stats">
+  FPS: <b id="fps">0</b><br>
+  Frame time: <b id="ft">0</b> ms<br>
+  Resolution: <b id="res">0</b><br>
+  Load: <b id="load">0</b> pixel-samples/frame
+</div>
+
+<section class="panel">
+  <h1>GPU stress controls</h1>
+  <div class="control"><div class="label"><label for="scale">Render scale</label><output id="scaleV">1.5×</output></div>
+    <input id="scale" type="range" min="0.5" max="3" step="0.25" value="1.5"></div>
+  <div class="control"><div class="label"><label for="passes">Passes per frame</label><output id="passesV">8</output></div>
+    <input id="passes" type="range" min="1" max="60" step="1" value="8"></div>
+  <div class="control"><div class="label"><label for="aa">Supersampling (N×N)</label><output id="aaV">2×2</output></div>
+    <input id="aa" type="range" min="1" max="4" step="1" value="2"></div>
+  <div class="control"><div class="label"><label for="steps">Ray steps</label><output id="stepsV">180</output></div>
+    <input id="steps" type="range" min="60" max="300" step="10" value="180"></div>
+  <div class="buttons">
+    <button data-p="2,1,1,120">LIGHT</button>
+    <button data-p="8,1.5,2,180">HEAVY</button>
+    <button data-p="20,2,3,240">EXTREME</button>
+    <button data-p="40,3,4,300">MELT GPU</button>
+  </div>
+  <div class="tip">Raise the sliders until FPS drops well below 60. That means the GPU is saturated. In Task Manager, open the GPU tab and select the <b>3D</b> engine graph.</div>
+</section>
+<div id="error"></div>
+
+<script>
+(() => {
+  const canvas = document.getElementById('gl');
+  const err = document.getElementById('error');
+  const gl = canvas.getContext('webgl', { antialias:false, alpha:false, powerPreference:'high-performance', preserveDrawingBuffer:false });
+  if (!gl) { err.style.display='block'; err.textContent='WebGL unavailable.'; return; }
+
+  const vs = `attribute vec2 aPosition; void main(){ gl_Position = vec4(aPosition,0.0,1.0); }`;
+
+  const fs = `
+  precision highp float;
+  uniform vec2 uResolution;
+  uniform float uTime, uAngleX, uAngleY, uDistance, uSteps, uJitter;
+  uniform int uAA;
+
+  vec3 rotX(vec3 p,float a){float c=cos(a),s=sin(a);return vec3(p.x,c*p.y-s*p.z,s*p.y+c*p.z);}
+  vec3 rotY(vec3 p,float a){float c=cos(a),s=sin(a);return vec3(c*p.x+s*p.z,p.y,-s*p.x+c*p.z);}
+
+  vec2 bulb(vec3 p){
+    vec3 z=p; float dr=1.0,r=0.0,trap=10.0;
+    for(int i=0;i<12;i++){
+      r=length(z);
+      trap=min(trap,min(r,abs(z.y)+abs(z.x)));
+      if(r>4.0)break;
+      float sr=max(r,1e-5);
+      float th=acos(clamp(z.z/sr,-1.0,1.0));
+      float ph=atan(z.y,z.x);
+      dr=pow(sr,7.0)*8.0*dr+1.0;
+      float zr=pow(sr,8.0);
+      th*=8.0; ph*=8.0;
+      z=zr*vec3(sin(th)*cos(ph),sin(th)*sin(ph),cos(th))+p;
+    }
+    return vec2(0.5*log(max(r,1e-5))*r/max(dr,1e-5),trap);
+  }
+
+  vec3 normalAt(vec3 p){
+    vec2 e=vec2(0.0012,0.0);
+    return normalize(vec3(
+      bulb(p+e.xyy).x-bulb(p-e.xyy).x,
+      bulb(p+e.yxy).x-bulb(p-e.yxy).x,
+      bulb(p+e.yyx).x-bulb(p-e.yyx).x));
+  }
+
+  vec3 shade(vec2 frag){
+    vec2 p=(2.0*frag-uResolution)/uResolution.y;
+    vec3 ro=vec3(0.0,0.0,uDistance);
+    vec3 rd=normalize(vec3(p*1.02,-1.65));
+    float ax=uAngleX+uJitter, ay=uAngleY+uJitter;
+    ro=rotY(rotX(ro,ax),ay);
+    rd=rotY(rotX(rd,ax),ay);
+
+    float t=0.0,trap=0.0; bool hit=false; vec3 pos=ro;
+    for(int i=0;i<300;i++){
+      if(float(i)>=uSteps)break;
+      pos=ro+rd*t;
+      vec2 h=bulb(pos);
+      trap=h.y;
+      if(h.x<0.0011){hit=true;break;}
+      if(t>14.0)break;
+      t+=max(h.x*0.72,0.0008);
+    }
+
+    vec3 col=vec3(0.006,0.009,0.025)+vec3(0.03,0.01,0.08)*exp(-3.0*abs(p.y));
+    if(hit){
+      vec3 n=normalAt(pos);
+      vec3 l1=normalize(vec3(-0.65,0.85,0.75));
+      float diff=max(dot(n,l1),0.0);
+      float fres=pow(1.0-max(dot(n,-rd),0.0),3.2);
+      float sp=length(pos)*0.34+trap*2.8+uTime*0.045;
+      vec3 base=0.5+0.5*cos(6.28318*(sp+vec3(0.0,0.33,0.67)));
+      float ao=clamp(0.45+trap*1.8,0.0,1.0);
+      col=base*(0.22+diff)*ao+base*fres*1.5;
+      col+=vec3(1.0)*pow(max(dot(n,normalize(l1-rd)),0.0),36.0)*0.8;
+    }
+    return col;
+  }
+
+  void main(){
+    vec3 acc=vec3(0.0); float cnt=0.0;
+    for(int sy=0;sy<4;sy++){
+      if(sy>=uAA)break;
+      for(int sx=0;sx<4;sx++){
+        if(sx>=uAA)break;
+        vec2 off=(vec2(float(sx),float(sy))+0.5)/float(uAA)-0.5;
+        acc+=shade(gl_FragCoord.xy+off);
+        cnt+=1.0;
+      }
+    }
+    vec3 col=acc/cnt;
+    col=col/(1.0+col);
+    col=pow(max(col,vec3(0.0)),vec3(0.88));
+    gl_FragColor=vec4(col,1.0);
+  }`;
+
+  function compile(type,src){
+    const s=gl.createShader(type); gl.shaderSource(s,src); gl.compileShader(s);
+    if(!gl.getShaderParameter(s,gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+    return s;
+  }
+  let prog;
+  try {
+    prog=gl.createProgram();
+    gl.attachShader(prog,compile(gl.VERTEX_SHADER,vs));
+    gl.attachShader(prog,compile(gl.FRAGMENT_SHADER,fs));
+    gl.linkProgram(prog);
+    if(!gl.getProgramParameter(prog,gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+  } catch(e){ err.style.display='block'; err.textContent='Shader error:\n'+e.message; return; }
+
+  gl.useProgram(prog);
+  const buf=gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER,buf);
+  gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([-1,-1,1,-1,-1,1,-1,1,1,-1,1,1]),gl.STATIC_DRAW);
+  const ap=gl.getAttribLocation(prog,'aPosition');
+  gl.enableVertexAttribArray(ap);
+  gl.vertexAttribPointer(ap,2,gl.FLOAT,false,0,0);
+
+  const U={};
+  ['uResolution','uTime','uAngleX','uAngleY','uDistance','uSteps','uJitter','uAA'].forEach(n=>U[n]=gl.getUniformLocation(prog,n));
+
+  const $=id=>document.getElementById(id);
+  const S={x:-0.25,y:0.4,dist:3.2,scale:1.5,passes:8,aa:2,steps:180,drag:false,lx:0,ly:0};
+
+  function bind(id,key,out,fmt){
+    const el=$(id);
+    const upd=()=>{ S[key]=Number(el.value); $(out).textContent=fmt(S[key]); if(id==='scale') resize(); };
+    el.addEventListener('input',upd);
+  }
+  bind('scale','scale','scaleV',v=>v+'×');
+  bind('passes','passes','passesV',v=>v);
+  bind('aa','aa','aaV',v=>v+'×'+v);
+  bind('steps','steps','stepsV',v=>v);
+
+  function setSlider(id,val){ $(id).value=val; $(id).dispatchEvent(new Event('input')); }
+  document.querySelectorAll('[data-p]').forEach(b=>b.addEventListener('click',()=>{
+    const [p,sc,aa,st]=b.dataset.p.split(',').map(Number);
+    setSlider('passes',p); setSlider('scale',sc); setSlider('aa',aa); setSlider('steps',st);
+  }));
+
+  canvas.addEventListener('pointerdown',e=>{S.drag=true;S.lx=e.clientX;S.ly=e.clientY;canvas.setPointerCapture(e.pointerId);});
+  canvas.addEventListener('pointermove',e=>{
+    if(!S.drag)return;
+    S.y+=(e.clientX-S.lx)*0.006; S.x+=(e.clientY-S.ly)*0.006;
+    S.x=Math.max(-1.55,Math.min(1.55,S.x)); S.lx=e.clientX; S.ly=e.clientY;
+  });
+  canvas.addEventListener('pointerup',()=>S.drag=false);
+  canvas.addEventListener('wheel',e=>{e.preventDefault();S.dist=Math.max(2.3,Math.min(7,S.dist*Math.exp(e.deltaY*0.001)));},{passive:false});
+
+  let W=1,H=1;
+  function resize(){
+    const dpr=window.devicePixelRatio||1;
+    const max=Math.min(gl.getParameter(gl.MAX_RENDERBUFFER_SIZE)||4096,8192);
+    W=Math.max(1,Math.min(max,Math.floor(canvas.clientWidth*dpr*S.scale)));
+    H=Math.max(1,Math.min(max,Math.floor(canvas.clientHeight*dpr*S.scale)));
+    canvas.width=W; canvas.height=H;
+    gl.viewport(0,0,W,H);
+    $('res').textContent=W+'×'+H;
+  }
+  window.addEventListener('resize',resize);
+  resize();
+
+  let last=performance.now(),elapsed=0,frames=0,acc=0;
+  function frame(now){
+    const dt=Math.min((now-last)/1000,0.1); last=now;
+    elapsed+=dt;
+    if(!S.drag) S.y+=dt*0.12;
+
+    gl.uniform2f(U.uResolution,W,H);
+    gl.uniform1f(U.uTime,elapsed);
+    gl.uniform1f(U.uAngleX,S.x);
+    gl.uniform1f(U.uAngleY,S.y);
+    gl.uniform1f(U.uDistance,S.dist);
+    gl.uniform1f(U.uSteps,S.steps);
+    gl.uniform1i(U.uAA,S.aa);
+
+    // Extra passes with a tiny camera jitter so the driver cannot skip or merge them;
+    // the last pass has zero jitter, so the visible image stays clean.
+    for(let i=S.passes-1;i>=0;i--){
+      gl.uniform1f(U.uJitter,i===0?0:i*1e-5);
+      gl.drawArrays(gl.TRIANGLES,0,6);
+    }
+
+    frames++; acc+=dt;
+    if(acc>=0.5){
+      const fps=frames/acc;
+      $('fps').textContent=fps.toFixed(0);
+      $('ft').textContent=(1000/fps).toFixed(1);
+      $('load').textContent=(W*H*S.aa*S.aa*S.passes/1e6).toFixed(1)+' M';
+      frames=0; acc=0;
+    }
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
